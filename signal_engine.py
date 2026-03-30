@@ -310,7 +310,6 @@ def build_alert(sig, prev):
 
 def main():
     log("BTC Signal Engine starting")
-    send("Test message from BTC Signal Engine - Telegram is working")
     state = load_state()
     prev_signal = state.get("signal")
     log(f"Previous signal: {prev_signal or 'None'}")
