@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-“””
-BTC/USD Signal Engine — GitHub Actions Cloud Version
-Runs once per trigger (GitHub handles the schedule).
-Config comes from environment variables (GitHub Secrets).
-State persisted via cache so it only alerts on signal changes.
-“””
-
 import os, json, time, requests, numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
