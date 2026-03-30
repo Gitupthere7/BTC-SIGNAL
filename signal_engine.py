@@ -310,6 +310,7 @@ def build_alert(sig, prev):
 
 def main():
     log("BTC Signal Engine starting")
+    send("Test message from BTC Signal Engine - Telegram is working")
     state = load_state()
     prev_signal = state.get("signal")
     log(f"Previous signal: {prev_signal or 'None'}")
@@ -317,7 +318,6 @@ def main():
     log("Fetching live data from Kraken...")
     candles = fetch_candles()
     log(f"Loaded {len(candles)} candles. Price: ${candles[-1]['c']:,.2f}")
-
     sig = compute(candles)
     if sig is None:
         log("Indicators warming up - skipping scan")
