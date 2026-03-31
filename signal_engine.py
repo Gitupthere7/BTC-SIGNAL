@@ -4,8 +4,8 @@ from pathlib import Path
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-ACCOUNT_CAPITAL  = float(os.environ.get("ACCOUNT_CAPITAL", "10000"))
-LEVERAGE         = int(os.environ.get("LEVERAGE", "5"))
+ACCOUNT_CAPITAL  = float(os.environ.get("ACCOUNT_CAPITAL", "100"))
+LEVERAGE         = int(os.environ.get("LEVERAGE", "10"))
 RISK_PCT         = float(os.environ.get("RISK_PER_TRADE", "2.0"))
 TP_PCT           = float(os.environ.get("TP_PCT", "2.5"))
 SL_PCT           = float(os.environ.get("SL_PCT", "1.5"))
