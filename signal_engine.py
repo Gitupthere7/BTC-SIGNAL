@@ -339,9 +339,11 @@ def build_cleared_alert(sig):
 
 def main():
     log('BTC 5-min VWAP Scalper starting')
-    state = load_state()
-    prev  = state.get('signal')
-    entry = state.get('entry')
+    state  = load_state()
+    prev   = state.get('signal')
+    entry  = state.get('entry')
+    tp_lvl = state.get('tp')
+    sl_lvl = state.get('sl')
     consec = state.get('consec', 0)
     log('Previous signal: ' + str(prev) + '  Consecutive: ' + str(consec))
 
@@ -355,11 +357,80 @@ def main():
         log('Indicators warming up - skipping')
         return
 
+    price = sig['price']
     log('Signal: ' + sig['signal']
         + '  Score: ' + str(sig['score']) + '/6'
         + '  ADX: ' + str(sig['adx'])
         + '  RSI: ' + str(sig['rsi'])
-        + '  Session: ' + str(sig['session']))
+        + '  Price: $' + '{:,.2f}'.format(price))
+
+    if prev == 'LONG' and entry and tp_lvl and sl_lvl:
+        if price >= tp_lvl:
+            pnl = (price - entry) / entry * 100
+            lines = [
+                'TAKE PROFIT HIT - BTC/USD',
+                '=' * 28,
+                'Entry    $' + '{:,.2f}'.format(entry),
+                'Exit     $' + '{:,.2f}'.format(price),
+                'P&L      +' + '{:.2f}'.format(pnl) + '%',
+                '',
+                'Close your LONG position now.',
+                '',
+                utc_now(),
+            ]
+            send('\n'.join(lines))
+            log('TP alert sent')
+            save_state({'signal': 'WAIT', 'entry': None,
+                        'tp': None, 'sl': None,
+                        'time': utc_now(), 'consec': 0})
+            return
+
+        if price <= sl_lvl:
+            pnl = (price - entry) / entry * 100
+            lines = [
+                'STOP LOSS HIT - BTC/USD',
+                '=' * 28,
+                'Entry    $' + '{:,.2f}'.format(entry),
+                'Exit     $' + '{:,.2f}'.format(price),
+                'P&L      ' + '{:.2f}'.format(pnl) + '%',
+                '',
+                'Close your LONG position now.',
+                '',
+                utc_now(),
+            ]
+            send('\n'.join(lines))
+            log('SL alert sent')
+            save_state({'signal': 'WAIT', 'entry': None,
+                        'tp': None, 'sl': None,
+                        'time': utc_now(), 'consec': 0})
+            return
+
+        if sig['vwap_break']:
+            pnl = (price - entry) / entry * 100
+            lines = [
+                'EARLY EXIT SIGNAL - BTC/USD',
+                '=' * 28,
+                'Entry    $' + '{:,.2f}'.format(entry),
+                'Price    $' + '{:,.2f}'.format(price),
+                'P&L now  ' + '{:+.2f}'.format(pnl) + '%',
+                '',
+                'Price broke below VWAP.',
+                'Consider closing early.',
+                '',
+                utc_now(),
+            ]
+            send('\n'.join(lines))
+            log('Early exit alert sent')
+            save_state({'signal': 'WAIT', 'entry': None,
+                        'tp': None, 'sl': None,
+                        'time': utc_now(), 'consec': 0})
+            return
+
+        log('In trade - entry $' + '{:,.2f}'.format(entry)
+            + '  TP $' + '{:,.2f}'.format(tp_lvl)
+            + '  SL $' + '{:,.2f}'.format(sl_lvl)
+            + '  Current $' + '{:,.2f}'.format(price))
+        return
 
     if sig['signal'] == 'LONG':
         consec = consec + 1
@@ -368,35 +439,30 @@ def main():
         if consec >= 3 and prev != 'LONG':
             send(build_long_alert(sig))
             log('LONG alert sent after 3 consecutive bars')
-            save_state({'signal': 'LONG', 'entry': sig['price'],
-                        'time': utc_now(), 'consec': consec})
-
-        elif consec >= 3 and prev == 'LONG':
-            log('Still LONG - holding')
-            if sig['vwap_break'] and entry:
-                send(build_exit_alert(sig, entry))
-                log('Early exit alert sent - VWAP break')
-                save_state({'signal': 'WAIT', 'entry': None,
-                            'time': utc_now(), 'consec': 0})
-            else:
-                save_state({'signal': 'LONG', 'entry': entry,
-                            'time': utc_now(), 'consec': consec})
-
+            save_state({'signal': 'LONG',
+                        'entry': sig['price'],
+                        'tp':    sig['tp'],
+                        'sl':    sig['sl'],
+                        'time':  utc_now(),
+                        'consec': consec})
         else:
             log('LONG building - waiting for 3 consecutive bars')
             save_state({'signal': 'BUILDING', 'entry': None,
+                        'tp': None, 'sl': None,
                         'time': utc_now(), 'consec': consec})
 
     elif sig['signal'] == 'WAIT':
         if consec > 0:
-            log('LONG streak broken - resetting counter')
+            log('LONG streak broken - resetting')
         if prev == 'LONG':
             send(build_cleared_alert(sig))
             log('Signal cleared - notified')
         save_state({'signal': 'WAIT', 'entry': None,
+                    'tp': None, 'sl': None,
                     'time': utc_now(), 'consec': 0})
 
     log('Scan complete')
 
 main()
+
 
