@@ -19,7 +19,7 @@ def load_state():
     try:
         return json.loads(STATE_FILE.read_text())
     except Exception:
-        return {'signal': None, 'entry': None, 'time': None, 'consec': 0}
+        return {'signal': None, 'entry': None, 'tp': None, 'sl': None, 'time': None, 'consec': 0}
 
 def save_state(data):
     STATE_DIR.mkdir(exist_ok=True)
