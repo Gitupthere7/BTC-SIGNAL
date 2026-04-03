@@ -2,7 +2,7 @@ name: BTC Signal Scanner
 
 on:
   schedule:
-    - cron: '5 * * * *'
+    - cron: '*/5 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -39,6 +39,7 @@ jobs:
           RISK_PER_TRADE:   ${{ vars.RISK_PER_TRADE }}
           TP_PCT:           ${{ vars.TP_PCT }}
           SL_PCT:           ${{ vars.SL_PCT }}
+          ADX_MIN:          ${{ vars.ADX_MIN }}
         run: python signal_engine.py
 
       - name: Save signal state
