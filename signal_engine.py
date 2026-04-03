@@ -1,310 +1,415 @@
-import os, json, time, requests, numpy as np
+import os, json, time, math, requests, numpy as np
 from datetime import datetime, timezone
 from pathlib import Path
 
-TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
-ACCOUNT_CAPITAL  = float(os.environ.get("ACCOUNT_CAPITAL", "100"))
-LEVERAGE         = int(os.environ.get("LEVERAGE", "10"))
-RISK_PCT         = float(os.environ.get("RISK_PER_TRADE", "2.0"))
-TP_PCT           = float(os.environ.get("TP_PCT", "2.5"))
-SL_PCT           = float(os.environ.get("SL_PCT", "1.5"))
-MIN_CONFIDENCE   = int(os.environ.get("MIN_CONFIDENCE", "70"))
+# ── Config from GitHub Secrets / Variables ───────────────────────
 
-STATE_DIR  = Path(".state")
-STATE_FILE = STATE_DIR / "signal_state.json"
+TELEGRAM_TOKEN   = os.environ.get(“TELEGRAM_TOKEN”, “”)
+TELEGRAM_CHAT_ID = os.environ.get(“TELEGRAM_CHAT_ID”, “”)
+ACCOUNT_CAPITAL  = float(os.environ.get(“ACCOUNT_CAPITAL”, “100”))
+LEVERAGE         = int(os.environ.get(“LEVERAGE”, “5”))
+MIN_CONFIDENCE   = int(os.environ.get(“MIN_CONFIDENCE”, “4”))
+RISK_PCT         = float(os.environ.get(“RISK_PER_TRADE”, “2.0”))
+TP_PCT           = float(os.environ.get(“TP_PCT”, “2.0”))
+SL_PCT           = float(os.environ.get(“SL_PCT”, “1.0”))
+ADX_MIN          = float(os.environ.get(“ADX_MIN”, “18”))
+
+# ── State ────────────────────────────────────────────────────────
+
+STATE_DIR  = Path(”.state”)
+STATE_FILE = STATE_DIR / “signal_state.json”
 
 def load_state():
-    try:
-        return json.loads(STATE_FILE.read_text())
-    except Exception:
-        return {"signal": None, "confidence": 0, "price": 0}
+try:
+return json.loads(STATE_FILE.read_text())
+except Exception:
+return {“signal”: None, “entry”: None, “time”: None}
 
 def save_state(data):
-    STATE_DIR.mkdir(exist_ok=True)
-    STATE_FILE.write_text(json.dumps(data))
+STATE_DIR.mkdir(exist_ok=True)
+STATE_FILE.write_text(json.dumps(data))
 
-def now_utc():
-    return datetime.now(timezone.utc).strftime("%H:%M UTC")
+def utc_now():
+return datetime.now(timezone.utc).strftime(”%H:%M UTC”)
 
 def log(msg):
-    print(f"[{datetime.now(timezone.utc).strftime('%H:%M:%S')}] {msg}")
+ts = datetime.now(timezone.utc).strftime(”%H:%M:%S”)
+print(”[” + ts + “] “ + str(msg))
 
-def fetch_candles():
-    since = int(time.time()) - 60 * 60 * 300
-    url = f"https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=60&since={since}"
-    r = requests.get(url, timeout=20)
-    r.raise_for_status()
-    data = r.json()
-    if data.get("error"):
-        raise ValueError(f"Kraken API: {data['error']}")
-    key = next(k for k in data["result"] if k != "last")
-    raw = data["result"][key]
-    return [
-        {"t": int(c[0]), "h": float(c[2]), "l": float(c[3]),
-         "c": float(c[4]), "v": float(c[6])}
-        for c in raw
-    ]
+# ── Kraken data ───────────────────────────────────────────────────
+
+def fetch_candles(interval=5, count=500):
+since = int(time.time()) - interval * 60 * count
+url = “https://api.kraken.com/0/public/OHLC”
+params = “?pair=XBTUSD&interval=” + str(interval) + “&since=” + str(since)
+r = requests.get(url + params, timeout=20)
+r.raise_for_status()
+data = r.json()
+if data.get(“error”):
+raise ValueError(“Kraken: “ + str(data[“error”]))
+key = next(k for k in data[“result”] if k != “last”)
+return [
+{“t”: int(c[0]), “h”: float(c[2]), “l”: float(c[3]),
+“c”: float(c[4]), “v”: float(c[6])}
+for c in data[“result”][key]
+]
+
+# ── Indicators ────────────────────────────────────────────────────
 
 def ema(arr, p):
-    arr = np.asarray(arr, float)
-    out = np.full(len(arr), np.nan)
-    if p > len(arr): return out
-    out[p - 1] = np.mean(arr[:p])
-    k = 2.0 / (p + 1)
-    for i in range(p, len(arr)):
-        out[i] = arr[i] * k + out[i - 1] * (1 - k)
-    return out
+a = np.array(arr, float)
+out = np.full(len(a), np.nan)
+if p > len(a):
+return out
+out[p - 1] = np.mean(a[:p])
+k = 2.0 / (p + 1)
+for i in range(p, len(a)):
+out[i] = a[i] * k + out[i - 1] * (1 - k)
+return out
 
 def rsi(closes, p=14):
-    c = np.asarray(closes, float)
-    out = np.full(len(c), np.nan)
-    for i in range(p, len(c)):
-        d = np.diff(c[i - p:i + 1])
-        g = d[d > 0].sum()
-        l = -d[d < 0].sum()
-        out[i] = 100 - 100 / (1 + (g / l if l else 100))
-    return out
+out = np.full(len(closes), np.nan)
+for i in range(p, len(closes)):
+d = np.diff(closes[i - p: i + 1])
+g = d[d > 0].sum()
+l = -d[d < 0].sum()
+out[i] = 100 - 100 / (1 + (g / l if l else 100))
+return out
 
-def macd_hist(closes, f=12, s=26, sg=9):
-    c = np.asarray(closes, float)
-    ef = ema(c, f)
-    es = ema(c, s)
-    ml = np.where(~np.isnan(ef) & ~np.isnan(es), ef - es, np.nan)
-    sl = np.full(len(c), np.nan)
-    buf = []
-    last = np.nan
-    k = 2.0 / (sg + 1)
-    for i, v in enumerate(ml):
-        if np.isnan(v): continue
-        buf.append(v)
-        if len(buf) < sg: continue
-        if len(buf) == sg: last = np.mean(buf)
-        else: last = v * k + last * (1 - k)
-        sl[i] = last
-    return np.where(~np.isnan(ml) & ~np.isnan(sl), ml - sl, np.nan)
+def macd_hist(closes):
+ef = ema(closes, 12)
+es = ema(closes, 26)
+ml = np.where(~np.isnan(ef) & ~np.isnan(es), ef - es, np.nan)
+sl = np.full(len(closes), np.nan)
+buf = []
+last = np.nan
+k = 2.0 / 10
+for i, v in enumerate(ml):
+if np.isnan(v):
+continue
+buf.append(v)
+if len(buf) < 9:
+continue
+if len(buf) == 9:
+last = np.mean(buf)
+else:
+last = v * k + last * (1 - k)
+sl[i] = last
+return np.where(~np.isnan(ml) & ~np.isnan(sl), ml - sl, np.nan)
 
-def vwap_daily(candles, reset=24):
-    hi = np.array([c["h"] for c in candles], float)
-    lo = np.array([c["l"] for c in candles], float)
-    cl = np.array([c["c"] for c in candles], float)
-    vl = np.array([c["v"] for c in candles], float)
-    tp = (hi + lo + cl) / 3
-    out = np.zeros(len(candles))
-    ctv = cv = 0.0
-    for i in range(len(candles)):
-        if i % reset == 0: ctv = cv = 0.0
-        ctv += tp[i] * vl[i]
-        cv  += vl[i]
-        out[i] = ctv / cv if cv > 0 else tp[i]
-    return out
+def adx_pdi_mdi(candles, p=14):
+hi = np.array([c[“h”] for c in candles])
+lo = np.array([c[“l”] for c in candles])
+cl = np.array([c[“c”] for c in candles])
+n  = len(candles)
+tr = np.zeros(n)
+pl = np.zeros(n)
+mn = np.zeros(n)
+tr[0] = hi[0] - lo[0]
+for i in range(1, n):
+tr[i] = max(hi[i] - lo[i],
+abs(hi[i] - cl[i - 1]),
+abs(lo[i] - cl[i - 1]))
+u = hi[i] - hi[i - 1]
+d = lo[i - 1] - lo[i]
+pl[i] = max(u, 0) if u > d else 0
+mn[i] = max(d, 0) if d > u else 0
+av  = np.where(ema(tr, p) < 0.001, 0.001, ema(tr, p))
+pdi = ema(pl, p) / av * 100
+mdi = ema(mn, p) / av * 100
+dx  = np.where((pdi + mdi) > 0,
+np.abs(pdi - mdi) / (pdi + mdi) * 100, 0.0)
+return ema(dx, p), pdi, mdi
 
-def atr(candles, p=14):
-    hi = np.array([c["h"] for c in candles], float)
-    lo = np.array([c["l"] for c in candles], float)
-    cl = np.array([c["c"] for c in candles], float)
-    tr = np.maximum(hi - lo,
-         np.maximum(np.abs(hi - np.roll(cl, 1)),
-                    np.abs(lo - np.roll(cl, 1))))
-    tr[0] = hi[0] - lo[0]
-    return ema(tr, p)
+def vwap_daily(candles, bars_per_day=288):
+n   = len(candles)
+tp  = np.array([(c[“h”] + c[“l”] + c[“c”]) / 3 for c in candles])
+vol = np.array([c[“v”] for c in candles])
+out = np.full(n, np.nan)
+for ds in range(0, n, bars_per_day):
+de  = min(ds + bars_per_day, n)
+ctv = np.cumsum(tp[ds:de] * vol[ds:de])
+cv  = np.cumsum(vol[ds:de])
+out[ds:de] = np.where(cv > 0, ctv / cv, tp[ds:de])
+return out
+
+def h1_ema(candles, period, bars_per_hour=12):
+# Downsample 5-min closes to 1H, compute EMA, map back
+n  = len(candles)
+cl = np.array([c[“c”] for c in candles])
+h1c = []
+h1i = []
+for i in range(0, n, bars_per_hour):
+end = min(i + bars_per_hour, n)
+h1c.append(cl[end - 1])
+h1i.append(end - 1)
+h1v  = ema(np.array(h1c), period)
+out  = np.full(n, np.nan)
+for k, idx in enumerate(h1i):
+prev = h1i[k - 1] + 1 if k > 0 else 0
+out[prev: idx + 1] = h1v[k]
+return out
+
+# ── Session check ─────────────────────────────────────────────────
+
+def in_session(unix_ts):
+hour = datetime.fromtimestamp(unix_ts, tz=timezone.utc).hour
+london = 8 <= hour < 16
+ny     = 13 <= hour < 21
+asia   = 0 <= hour < 4
+return london or ny or asia
+
+# ── Signal compute ────────────────────────────────────────────────
 
 def compute(candles):
-    if len(candles) < 55:
-        return None
-    c    = np.array([x["c"] for x in candles], float)
-    n    = len(c)
-    i    = n - 1
-    pv   = n - 2
-    pv2  = n - 3
-    price = c[i]
-    e9    = ema(c, 9)
-    e21   = ema(c, 21)
-    e50   = ema(c, 50)
-    e200  = ema(c, 200)
-    rv    = rsi(c, 14)
-    mh    = macd_hist(c)
-    vwap  = vwap_daily(candles, 24)
-    atr_v = atr(candles, 14)
-    vol   = np.array([x["v"] for x in candles], float)
-    volma = ema(vol, 20)
-    e9v   = e9[i];   e9p   = e9[pv]
-    e21v  = e21[i];  e21p  = e21[pv]
-    e50v  = e50[i]
-    e200v = e200[i]; e200p = e200[pv]
-    rvv   = rv[i];   rvp   = rv[pv];  rvp2 = rv[pv2]
-    mhv   = mh[i];   mhp   = mh[pv]
-    vwapv = vwap[i]
-    atrv  = atr_v[i]
-    volv  = vol[i];  volmv = volma[i]
-    if any(np.isnan(x) for x in [e9v, e21v, e50v, e200v, rvv, mhv, atrv]):
-        return None
-    regime_bull = e200v > e200p and price > e200v and e50v > e200v
-    regime_bear = e200v < e200p and price < e200v and e50v < e200v
-    long_checks = [
-        ("EMA ribbon stacked bullish 9>21>50",      e9v > e21v > e50v),
-        ("RSI dipped then recovered into 44-65",    (rvp < 55 or rvp2 < 55) and 44 < rvv < 65 and rvv > rvp),
-        ("MACD histogram positive",                 mhv > 0),
-        ("Price above VWAP",                        price > vwapv * 0.998),
-        ("Volume above average",                    np.isnan(volmv) or volv > volmv * 0.9),
-        ("Uptrend regime confirmed",                regime_bull),
-    ]
-    short_checks = [
-        ("EMA ribbon stacked bearish 9<21<50",      e9v < e21v < e50v),
-        ("RSI elevated then falling into 35-56",    (rvp > 45 or rvp2 > 45) and 35 < rvv < 56 and rvv < rvp),
-        ("MACD histogram negative",                 mhv < 0),
-        ("Price below VWAP",                        price < vwapv * 1.002),
-        ("Volume above average",                    np.isnan(volmv) or volv > volmv * 0.9),
-        ("Downtrend regime confirmed",              regime_bear),
-    ]
-    long_bonus = [
-        ("Fresh MACD bullish cross",                mhv > 0 and mhp <= 0),
-        ("Fresh EMA 9/21 bullish cross",            e9v > e21v and e9p <= e21p),
-        ("Three consecutive rising candles",        c[i] > c[pv] > c[pv2]),
-        ("RSI recovering from oversold",            rvv > 40 and rvp < 42),
-    ]
-    short_bonus = [
-        ("Fresh MACD bearish cross",                mhv < 0 and mhp >= 0),
-        ("Fresh EMA 9/21 bearish cross",            e9v < e21v and e9p >= e21p),
-        ("Three consecutive falling candles",       c[i] < c[pv] < c[pv2]),
-        ("RSI falling from overbought",             rvv < 60 and rvp > 58),
-    ]
-    long_base  = sum(1 for _, v in long_checks if v)
-    short_base = sum(1 for _, v in short_checks if v)
-    long_bon   = sum(1 for _, v in long_bonus if v)
-    short_bon  = sum(1 for _, v in short_bonus if v)
-    long_conf  = round(long_base  / 6 * 60 + long_bon  / 4 * 40)
-    short_conf = round(short_base / 6 * 60 + short_bon / 4 * 40)
-    long_valid  = long_base  == 6
-    short_valid = short_base == 6
-    if long_valid and long_conf >= MIN_CONFIDENCE and long_conf >= short_conf:
-        signal     = "LONG"
-        confidence = long_conf
-        reasons    = [name for name, v in long_checks + long_bonus   if v]
-    elif short_valid and short_conf >= MIN_CONFIDENCE and short_conf > long_conf:
-        signal     = "SHORT"
-        confidence = short_conf
-        reasons    = [name for name, v in short_checks + short_bonus if v]
-    else:
-        signal     = "STAY OUT"
-        confidence = max(long_conf, short_conf)
-        if long_conf >= short_conf:
-            reasons = ["Missing for LONG: " + n for n, v in long_checks  if not v][:3]
-        else:
-            reasons = ["Missing for SHORT: " + n for n, v in short_checks if not v][:3]
-    if signal == "LONG":
-        tp = price * (1 + TP_PCT / 100)
-        sl = price * (1 - SL_PCT / 100)
-    elif signal == "SHORT":
-        tp = price * (1 - TP_PCT / 100)
-        sl = price * (1 + SL_PCT / 100)
-    else:
-        tp = price * (1 + TP_PCT / 100)
-        sl = price * (1 - SL_PCT / 100)
-    risk_usd   = ACCOUNT_CAPITAL * (RISK_PCT / 100)
-    notional   = risk_usd / (SL_PCT / 100)
-    margin_req = notional / LEVERAGE
-    btc_qty    = notional / price
-    liq_dist   = (1 / LEVERAGE) * price * 0.9
-    liq_price  = (price - liq_dist) if signal == "LONG" else (price + liq_dist)
-    return {
-        "signal": signal, "confidence": confidence, "price": price,
-        "tp": tp, "sl": sl, "reasons": reasons,
-        "risk_usd": risk_usd, "notional": notional,
-        "margin_req": margin_req, "btc_qty": btc_qty, "liq_price": liq_price,
-        "regime": "UPTREND" if regime_bull else "DOWNTREND" if regime_bear else "RANGING",
-        "rsi": round(float(rvv), 1), "macd": round(float(mhv), 2),
-        "atr": round(float(atrv), 0), "e200_slope": "Rising" if e200v > e200p else "Falling",
-        "long_base": long_base, "short_base": short_base,
-    }
+if len(candles) < 300:
+return None
+
+```
+cl  = np.array([c["c"] for c in candles])
+vl  = np.array([c["v"] for c in candles])
+n   = len(cl)
+i   = n - 1
+pv  = n - 2
+pv2 = n - 3
+
+e9   = ema(cl, 9)
+e21  = ema(cl, 21)
+e50  = ema(cl, 50)
+rv   = rsi(cl, 14)
+mh   = macd_hist(cl)
+vw   = vwap_daily(candles, 288)
+vm   = ema(vl, 20)
+adxv, pdi, mdi = adx_pdi_mdi(candles, 14)
+h1e21 = h1_ema(candles, 21)
+h1e50 = h1_ema(candles, 50)
+
+price = cl[i]
+
+# Bail if indicators not warm
+needed = [e9[i], e21[i], rv[i], mh[i], vw[i], adxv[i]]
+if any(np.isnan(x) for x in needed):
+    return None
+
+# ── SESSION ─────────────────────────────────────────────────
+session_active = in_session(candles[i]["t"])
+
+# ── ADX REGIME FILTER ────────────────────────────────────────
+adx_ok  = adxv[i] >= ADX_MIN
+trend_ok = pdi[i] > mdi[i]
+
+# ── 1H TREND ─────────────────────────────────────────────────
+h1_bull = True
+if not np.isnan(h1e21[i]) and not np.isnan(h1e50[i]):
+    h1_bull = h1e21[i] > h1e50[i]
+
+# ── LONG CONDITIONS (score 0-6) ───────────────────────────────
+above_vwap    = price > vw[i]
+rsi_pullback  = ((rv[pv] < 52 or (pv2 >= 0 and rv[pv2] < 52))
+                 and rv[i] > 44 and rv[i] > rv[pv])
+ema_cross     = e9[i] > e21[i] and e9[pv] <= e21[pv]
+macd_pos      = mh[i] > 0
+vol_ok        = (vl[i] > vm[i] * 0.8) if not np.isnan(vm[i]) else True
+vwap_bounce   = ((price > vw[i] and cl[pv] < vw[pv])
+                 or (price > vw[i] and price > e9[i]))
+
+conditions = [above_vwap, rsi_pullback, ema_cross,
+              macd_pos, vol_ok, vwap_bounce]
+score = sum(conditions)
+fired = []
+if above_vwap:    fired.append("Price above VWAP")
+if rsi_pullback:  fired.append("RSI pulled back then recovering (" + str(round(rv[i], 1)) + ")")
+if ema_cross:     fired.append("EMA9 just crossed above EMA21")
+if macd_pos:      fired.append("MACD histogram positive (" + str(round(float(mh[i]), 2)) + ")")
+if vol_ok:        fired.append("Volume above average")
+if vwap_bounce:   fired.append("Price bouncing off / above VWAP")
+if adx_ok:        fired.append("ADX " + str(round(adxv[i], 1)) + " - trend confirmed")
+if trend_ok:      fired.append("+DI > -DI - buyers in control")
+if h1_bull:       fired.append("1H EMA21 > EMA50 - higher TF bullish")
+
+# ── SIGNAL DECISION ──────────────────────────────────────────
+# Hard requirements: score >= MIN_CONFIDENCE, ADX ok, trend ok
+# Also require above_vwap and ema_cross as minimum
+valid_long = (score >= MIN_CONFIDENCE
+              and above_vwap
+              and adx_ok
+              and trend_ok
+              and session_active)
+
+# ── EXIT SIGNAL ──────────────────────────────────────────────
+vwap_break = (price < vw[i] and cl[pv] > vw[pv] and mh[i] < 0)
+
+# ── TRADE LEVELS ─────────────────────────────────────────────
+tp = price * (1 + TP_PCT / 100)
+sl = price * (1 - SL_PCT / 100)
+
+# ── POSITION SIZE ─────────────────────────────────────────────
+risk_usd   = ACCOUNT_CAPITAL * (RISK_PCT / 100)
+notional   = risk_usd / (SL_PCT / 100)
+margin_req = notional / LEVERAGE
+btc_qty    = notional / price
+liq_price  = price - (1 / LEVERAGE) * price * 0.90
+
+return {
+    "signal":       "LONG" if valid_long else "WAIT",
+    "vwap_break":   vwap_break,
+    "score":        score,
+    "price":        price,
+    "tp":           tp,
+    "sl":           sl,
+    "fired":        fired,
+    "risk_usd":     risk_usd,
+    "notional":     notional,
+    "margin_req":   margin_req,
+    "btc_qty":      btc_qty,
+    "liq_price":    liq_price,
+    "adx":          round(adxv[i], 1),
+    "pdi":          round(pdi[i], 1),
+    "mdi":          round(mdi[i], 1),
+    "rsi":          round(rv[i], 1),
+    "macd":         round(float(mh[i]), 2),
+    "vwap":         round(vw[i], 2),
+    "session":      session_active,
+    "adx_ok":       adx_ok,
+    "h1_bull":      h1_bull,
+}
+```
+
+# ── Telegram ──────────────────────────────────────────────────────
 
 def send(message):
-    if not TELEGRAM_TOKEN:
-        print("TELEGRAM NOT SET")
-        print(message)
-        return
-    requests.post(
-        f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-        json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
-        timeout=10,
-    ).raise_for_status()
+if not TELEGRAM_TOKEN:
+print(“NO TELEGRAM TOKEN - message below:”)
+print(message)
+return
+url = “https://api.telegram.org/bot” + TELEGRAM_TOKEN + “/sendMessage”
+requests.post(url,
+json={“chat_id”: TELEGRAM_CHAT_ID,
+“text”: message,
+“parse_mode”: “HTML”},
+timeout=10).raise_for_status()
 
-def build_alert(sig, prev):
-    p  = sig["price"]
-    tp = sig["tp"]
-    sl = sig["sl"]
-    s  = sig["signal"]
-    if s == "STAY OUT":
-        missing = "\n".join("  - " + r for r in sig["reasons"][:3])
-        return (
-            "<b>STAY OUT - BTC/USD</b>\n"
-            "Was: " + str(prev) + "   Now: STAY OUT\n"
-            "Price: $" + f"{p:,.2f}" + "\n"
-            "Regime: " + sig["regime"] + "  RSI: " + str(sig["rsi"]) + "  MACD: " + str(sig["macd"]) + "\n\n"
-            "<b>Not firing because:</b>\n" + missing + "\n\n"
-            "Long score:  " + str(sig["long_base"]) + "/6 base conditions\n"
-            "Short score: " + str(sig["short_base"]) + "/6 base conditions\n\n"
-            + now_utc()
-        )
-    arrow    = "BUY - Open LONG" if s == "LONG" else "SELL - Open SHORT"
-    tp_label = "+" + str(TP_PCT) + "%" if s == "LONG" else "-" + str(TP_PCT) + "%"
-    sl_label = "-" + str(SL_PCT) + "%" if s == "LONG" else "+" + str(SL_PCT) + "%"
-    reasons  = "\n".join("  > " + r for r in sig["reasons"])
-    title    = "<b>LONG - BTC/USD</b>" if s == "LONG" else "<b>SHORT - BTC/USD</b>"
-    return (
-        title + "\n"
-        "Price:      $" + f"{p:>12,.2f}" + "\n"
-        "Target:     $" + f"{tp:>12,.2f}" + "   (" + tp_label + ")\n"
-        "Stop:       $" + f"{sl:>12,.2f}" + "   (" + sl_label + ")\n"
-        "Confidence: " + str(sig["confidence"]) + "%\n"
-        "Regime:     " + sig["regime"] + "  EMA200: " + sig["e200_slope"] + "\n"
-        "RSI: " + str(sig["rsi"]) + "   MACD: " + str(sig["macd"]) + "   ATR: " + str(sig["atr"]) + "\n\n"
-        "<b>Why " + s + ":</b>\n" + reasons + "\n\n"
-        "<b>Position (" + str(LEVERAGE) + "x margin):</b>\n"
-        "  Notional:    $" + f"{sig['notional']:>10,.2f}" + "\n"
-        "  Margin req:  $" + f"{sig['margin_req']:>10,.2f}" + "\n"
-        "  BTC qty:      " + f"{sig['btc_qty']:>10.6f}" + "\n"
-        "  Max loss:    $" + f"{sig['risk_usd']:>10,.2f}" + "  (2% capital)\n"
-        "  Est liq:     $" + f"{sig['liq_price']:>10,.2f}" + "\n\n"
-        "<b>ACTION: " + arrow + " on Kraken margin</b>\n\n"
-        "Backtest: 84% WR  |  8.9 PF  |  5.4% max DD\n"
-        + now_utc() + "\n"
-        "<i>Signal only. Verify on Kraken 1H chart first.</i>"
-    )
+def build_long_alert(sig):
+reasons = “\n”.join(”  - “ + r for r in sig[“fired”])
+p  = sig[“price”]
+tp = sig[“tp”]
+sl = sig[“sl”]
+
+```
+msg  = "LONG - BTC/USD\n"
+msg += "=" * 28 + "\n"
+msg += "Price    $" + "{:,.2f}".format(p) + "\n"
+msg += "Target   $" + "{:,.2f}".format(tp) + "  (+" + str(TP_PCT) + "%)\n"
+msg += "Stop     $" + "{:,.2f}".format(sl) + "  (-" + str(SL_PCT) + "%)\n"
+msg += "VWAP     $" + "{:,.2f}".format(sig["vwap"]) + "\n"
+msg += "ADX " + str(sig["adx"]) + "  RSI " + str(sig["rsi"]) + "\n\n"
+msg += "Why:\n" + reasons + "\n\n"
+msg += "Position (" + str(LEVERAGE) + "x margin):\n"
+msg += "  Notional  $" + "{:,.2f}".format(sig["notional"]) + "\n"
+msg += "  Margin    $" + "{:,.2f}".format(sig["margin_req"]) + "\n"
+msg += "  BTC qty   " + "{:.6f}".format(sig["btc_qty"]) + "\n"
+msg += "  Max loss  $" + "{:,.2f}".format(sig["risk_usd"]) + "\n"
+msg += "  Est liq   $" + "{:,.2f}".format(sig["liq_price"]) + "\n\n"
+msg += "ACTION: BUY on Kraken margin\n"
+msg += "TP +" + str(TP_PCT) + "% | SL -" + str(SL_PCT) + "%\n\n"
+msg += utc_now() + "\n"
+msg += "Signal only. Verify before trading."
+return msg
+```
+
+def build_exit_alert(sig, entry_price):
+p   = sig[“price”]
+pnl = (p - entry_price) / entry_price * 100
+msg  = “EXIT SIGNAL - BTC/USD\n”
+msg += “=” * 28 + “\n”
+msg += “Price    $” + “{:,.2f}”.format(p) + “\n”
+msg += “Entry    $” + “{:,.2f}”.format(entry_price) + “\n”
+msg += “P&L      “ + “{:+.2f}”.format(pnl) + “%\n\n”
+msg += “Reason: Price broke below VWAP\n”
+msg += “        with MACD turning negative\n\n”
+msg += “Consider closing position early\n”
+msg += “if not already at TP or SL.\n\n”
+msg += utc_now()
+return msg
+
+def build_wait_alert(sig):
+missing = []
+if not sig[“adx_ok”]:
+missing.append(“ADX “ + str(sig[“adx”]) + “ below “ + str(ADX_MIN) + “ (market ranging)”)
+if sig[“adx_ok”] and sig[“pdi”] <= sig[“mdi”]:
+missing.append(”+DI < -DI (sellers in control)”)
+if not sig[“h1_bull”]:
+missing.append(“1H trend not bullish”)
+if not sig[“session”]:
+missing.append(“Outside active session”)
+if sig[“score”] < MIN_CONFIDENCE:
+missing.append(“Score “ + str(sig[“score”]) + “/” + str(MIN_CONFIDENCE) + “ minimum”)
+miss_str = “\n”.join(”  - “ + m for m in missing) if missing else “  - Conditions not met”
+msg  = “SIGNAL CLEARED - BTC/USD\n”
+msg += “=” * 28 + “\n”
+msg += “Price    $” + “{:,.2f}”.format(sig[“price”]) + “\n”
+msg += “Was: LONG  Now: WAIT\n\n”
+msg += “Not meeting entry criteria:\n” + miss_str + “\n\n”
+msg += utc_now()
+return msg
+
+# ── Main ──────────────────────────────────────────────────────────
 
 def main():
-    log("BTC 1H Signal Engine starting")
-    state = load_state()
-    prev  = state.get("signal")
-    log("Previous signal: " + str(prev or "None"))
-    log("Fetching 1-hour BTC/USD candles from Kraken...")
-    candles = fetch_candles()
-    log("Loaded " + str(len(candles)) + " candles. Price: $" + f"{candles[-1]['c']:,.2f}")
-    sig = compute(candles)
-    if sig is None:
-        log("Indicators warming up - need more candles")
-        return
-    log("Signal: " + sig["signal"] + "  Confidence: " + str(sig["confidence"]) + "%  Regime: " + sig["regime"])
-    log("Long base: " + str(sig["long_base"]) + "/6  Short base: " + str(sig["short_base"]) + "/6")
-    should_alert = False
-    if sig["signal"] in ("LONG", "SHORT"):
-        if sig["confidence"] >= MIN_CONFIDENCE:
-            if sig["signal"] != prev:
-                should_alert = True
-                log("Direction change: " + str(prev) + " -> " + sig["signal"] + ". Alerting.")
-            else:
-                log("Same direction as last alert. No repeat.")
-        else:
-            log("Confidence " + str(sig["confidence"]) + "% below threshold " + str(MIN_CONFIDENCE) + "%.")
-    elif sig["signal"] == "STAY OUT" and prev in ("LONG", "SHORT"):
-        should_alert = True
-        log("Signal cleared. Notifying.")
-    if should_alert:
-        msg = build_alert(sig, prev)
+log(“BTC 5-min VWAP Scalper starting”)
+state = load_state()
+prev  = state.get(“signal”)
+entry = state.get(“entry”)
+log(“Previous signal: “ + str(prev))
+
+```
+log("Fetching 5-min candles from Kraken...")
+candles = fetch_candles(interval=5, count=500)
+log("Loaded " + str(len(candles)) + " candles. Price: $" + "{:,.2f}".format(candles[-1]["c"]))
+
+sig = compute(candles)
+if sig is None:
+    log("Indicators warming up - skipping")
+    return
+
+log("Signal: " + sig["signal"] + "  Score: " + str(sig["score"]) + "/6"
+    + "  ADX: " + str(sig["adx"])
+    + "  RSI: " + str(sig["rsi"])
+    + "  Session: " + str(sig["session"]))
+
+# ── ENTRY ALERT ──────────────────────────────────────────────
+if sig["signal"] == "LONG" and prev != "LONG":
+    msg = build_long_alert(sig)
+    send(msg)
+    log("LONG alert sent")
+    save_state({"signal": "LONG",
+                "entry": sig["price"],
+                "time": utc_now()})
+
+# ── EARLY EXIT ALERT ─────────────────────────────────────────
+elif sig["signal"] == "LONG" and prev == "LONG":
+    log("Still LONG - no repeat alert")
+    if sig["vwap_break"] and entry:
+        msg = build_exit_alert(sig, entry)
         send(msg)
-        log("Alert sent.")
-    save_state({"signal": sig["signal"], "confidence": sig["confidence"],
-                "price": sig["price"], "time": now_utc()})
-    log("Done.")
+        log("Early exit alert sent - VWAP break detected")
+        save_state({"signal": "WAIT",
+                    "entry": None,
+                    "time": utc_now()})
+
+# ── SIGNAL CLEARED ───────────────────────────────────────────
+elif sig["signal"] == "WAIT" and prev == "LONG":
+    msg = build_wait_alert(sig)
+    send(msg)
+    log("Signal cleared - notified")
+    save_state({"signal": "WAIT",
+                "entry": None,
+                "time": utc_now()})
+
+else:
+    log("WAIT - no change from previous state")
+
+log("Scan complete")
+```
 
 main()
