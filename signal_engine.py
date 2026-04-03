@@ -342,7 +342,8 @@ def main():
     state = load_state()
     prev  = state.get('signal')
     entry = state.get('entry')
-    log('Previous signal: ' + str(prev))
+    consec = state.get('consec', 0)
+    log('Previous signal: ' + str(prev) + '  Consecutive: ' + str(consec))
 
     log('Fetching 5-min candles from Kraken...')
     candles = fetch_candles(interval=5, count=500)
@@ -360,26 +361,42 @@ def main():
         + '  RSI: ' + str(sig['rsi'])
         + '  Session: ' + str(sig['session']))
 
-    if sig['signal'] == 'LONG' and prev != 'LONG':
-        send(build_long_alert(sig))
-        log('LONG alert sent')
-        save_state({'signal': 'LONG', 'entry': sig['price'], 'time': utc_now()})
+    if sig['signal'] == 'LONG':
+        consec = consec + 1
+        log('Consecutive LONG bars: ' + str(consec) + '/3')
 
-    elif sig['signal'] == 'LONG' and prev == 'LONG':
-        log('Still LONG - holding')
-        if sig['vwap_break'] and entry:
-            send(build_exit_alert(sig, entry))
-            log('Early exit alert sent - VWAP break')
-            save_state({'signal': 'WAIT', 'entry': None, 'time': utc_now()})
+        if consec >= 3 and prev != 'LONG':
+            send(build_long_alert(sig))
+            log('LONG alert sent after 3 consecutive bars')
+            save_state({'signal': 'LONG', 'entry': sig['price'],
+                        'time': utc_now(), 'consec': consec})
 
-    elif sig['signal'] == 'WAIT' and prev == 'LONG':
-        send(build_cleared_alert(sig))
-        log('Signal cleared - notified')
-        save_state({'signal': 'WAIT', 'entry': None, 'time': utc_now()})
+        elif consec >= 3 and prev == 'LONG':
+            log('Still LONG - holding')
+            if sig['vwap_break'] and entry:
+                send(build_exit_alert(sig, entry))
+                log('Early exit alert sent - VWAP break')
+                save_state({'signal': 'WAIT', 'entry': None,
+                            'time': utc_now(), 'consec': 0})
+            else:
+                save_state({'signal': 'LONG', 'entry': entry,
+                            'time': utc_now(), 'consec': consec})
 
-    else:
-        log('WAIT - no change')
+        else:
+            log('LONG building - waiting for 3 consecutive bars')
+            save_state({'signal': 'BUILDING', 'entry': None,
+                        'time': utc_now(), 'consec': consec})
+
+    elif sig['signal'] == 'WAIT':
+        if consec > 0:
+            log('LONG streak broken - resetting counter')
+        if prev == 'LONG':
+            send(build_cleared_alert(sig))
+            log('Signal cleared - notified')
+        save_state({'signal': 'WAIT', 'entry': None,
+                    'time': utc_now(), 'consec': 0})
 
     log('Scan complete')
 
 main()
+
