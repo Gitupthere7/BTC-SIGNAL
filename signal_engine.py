@@ -451,7 +451,12 @@ def main():
         + '  LScore: ' + str(sig['long_score'])
         + '  SScore: ' + str(sig['short_score'])
         + '  ADX: ' + str(sig['adx'])
-        + '  RSI: ' + str(sig['rsi']))
+        + '  PDI: ' + str(sig['pdi'])
+        + '  MDI: ' + str(sig['mdi'])
+        + '  RSI: ' + str(sig['rsi'])
+        + '  H1Bear: ' + str(sig['h1_bear'])
+        + '  Session: ' + str(sig['session']))
+
 
     # IN A LONG TRADE - monitor for exit
     if prev == 'LONG' and entry and tp_lvl and sl_lvl:
