@@ -8,12 +8,18 @@ ACCOUNT_CAPITAL  = float(os.environ.get('ACCOUNT_CAPITAL', '100'))
 LEVERAGE         = int(os.environ.get('LEVERAGE', '10'))
 MIN_CONFIDENCE   = int(os.environ.get('MIN_CONFIDENCE', '4'))
 RISK_PCT         = float(os.environ.get('RISK_PER_TRADE', '2.0'))
-TP_PCT           = float(os.environ.get('TP_PCT', '0.2'))
-SL_PCT           = float(os.environ.get('SL_PCT', '0.1'))
+TP_PCT           = float(os.environ.get('TP_PCT', '0.6'))
+SL_PCT           = float(os.environ.get('SL_PCT', '0.12'))
 ADX_MIN          = float(os.environ.get('ADX_MIN', '18'))
+
+TAKER_FEE_PCT   = float(os.environ.get('TAKER_FEE_PCT', '0.05'))
+ROUND_TRIP_FEE  = TAKER_FEE_PCT * 2
+BREAKEVEN_TP    = ROUND_TRIP_FEE * 1.5
+CONFIRM_CANDLES = int(os.environ.get('CONFIRM_CANDLES', '2'))
 
 STATE_DIR  = Path('.state')
 STATE_FILE = STATE_DIR / 'last_signal.json'
+
 
 def load_state():
     try:
@@ -22,16 +28,20 @@ def load_state():
         return {'signal': None, 'entry': None, 'tp': None,
                 'sl': None, 'time': None, 'consec_l': 0, 'consec_s': 0}
 
+
 def save_state(data):
     STATE_DIR.mkdir(exist_ok=True)
     STATE_FILE.write_text(json.dumps(data))
 
+
 def utc_now():
     return datetime.now(timezone.utc).strftime('%H:%M UTC')
+
 
 def log(msg):
     ts = datetime.now(timezone.utc).strftime('%H:%M:%S')
     print('[' + ts + '] ' + str(msg))
+
 
 def fetch_candles(interval=5, count=500):
     since = int(time.time()) - interval * 60 * count
@@ -50,6 +60,7 @@ def fetch_candles(interval=5, count=500):
         for c in data['result'][key]
     ]
 
+
 def ema(arr, p):
     a = np.array(arr, float)
     out = np.full(len(a), np.nan)
@@ -61,6 +72,7 @@ def ema(arr, p):
         out[i] = a[i] * k + out[i - 1] * (1 - k)
     return out
 
+
 def rsi(closes, p=14):
     out = np.full(len(closes), np.nan)
     for i in range(p, len(closes)):
@@ -69,6 +81,7 @@ def rsi(closes, p=14):
         l = -d[d < 0].sum()
         out[i] = 100 - 100 / (1 + (g / l if l else 100))
     return out
+
 
 def macd_hist(closes):
     ef = ema(closes, 12)
@@ -90,6 +103,7 @@ def macd_hist(closes):
             last = v * k + last * (1 - k)
         sl[i] = last
     return np.where(~np.isnan(ml) & ~np.isnan(sl), ml - sl, np.nan)
+
 
 def adx_pdi_mdi(candles, p=14):
     hi = np.array([c['h'] for c in candles])
@@ -115,6 +129,7 @@ def adx_pdi_mdi(candles, p=14):
                    np.abs(pdi - mdi) / (pdi + mdi) * 100, 0.0)
     return ema(dx, p), pdi, mdi
 
+
 def vwap_daily(candles, bars_per_day=288):
     n   = len(candles)
     tp  = np.array([(c['h'] + c['l'] + c['c']) / 3 for c in candles])
@@ -126,6 +141,7 @@ def vwap_daily(candles, bars_per_day=288):
         cv  = np.cumsum(vol[ds:de])
         out[ds:de] = np.where(cv > 0, ctv / cv, tp[ds:de])
     return out
+
 
 def h1_ema(candles, period, bars_per_hour=12):
     n   = len(candles)
@@ -143,12 +159,20 @@ def h1_ema(candles, period, bars_per_hour=12):
         out[prev: idx + 1] = h1v[k]
     return out
 
+
 def in_session(unix_ts):
     hour   = datetime.fromtimestamp(unix_ts, tz=timezone.utc).hour
     london = 8 <= hour < 16
     ny     = 13 <= hour < 21
     asia   = 0 <= hour < 4
     return london or ny or asia
+
+
+def safe_notional(risk_usd, sl_pct, leverage, capital):
+    notional_ideal = risk_usd / (sl_pct / 100)
+    notional_max   = capital * leverage
+    return min(notional_ideal, notional_max)
+
 
 def compute(candles):
     if len(candles) < 300:
@@ -184,7 +208,6 @@ def compute(candles):
         h1_bull = h1e21[i] > h1e50[i]
         h1_bear = h1e21[i] < h1e50[i]
 
-    # LONG conditions
     above_vwap  = price > vw[i]
     rsi_pull    = ((rv[pv] < 52 or (pv2 >= 0 and rv[pv2] < 52))
                    and rv[i] > 44 and rv[i] > rv[pv])
@@ -196,7 +219,6 @@ def compute(candles):
     long_score  = sum([above_vwap, rsi_pull, ema_cross_l,
                        macd_pos, vol_ok, vwap_bou_l])
 
-    # SHORT conditions (mirror)
     below_vwap  = price < vw[i]
     rsi_fall    = ((rv[pv] > 48 or (pv2 >= 0 and rv[pv2] > 48))
                    and rv[i] < 56 and rv[i] < rv[pv])
@@ -211,6 +233,27 @@ def compute(candles):
                    and adx_ok and pdi_wins and h1_bull and session_active)
     short_valid = (short_score >= MIN_CONFIDENCE and below_vwap
                    and adx_ok and mdi_wins and h1_bear and session_active)
+
+    risk_usd   = ACCOUNT_CAPITAL * (RISK_PCT / 100)
+    notional   = safe_notional(risk_usd, SL_PCT, LEVERAGE, ACCOUNT_CAPITAL)
+    margin_req = notional / LEVERAGE
+    btc_qty    = notional / price
+
+    fee_cost_usd = notional * (ROUND_TRIP_FEE / 100)
+    tp_gross_usd = notional * (TP_PCT / 100)
+    tp_net_usd   = tp_gross_usd - fee_cost_usd
+    sl_gross_usd = notional * (SL_PCT / 100)
+    sl_net_usd   = sl_gross_usd + fee_cost_usd
+
+    tp_l = price * (1 + TP_PCT / 100)
+    sl_l = price * (1 - SL_PCT / 100)
+    tp_s = price * (1 - TP_PCT / 100)
+    sl_s = price * (1 + SL_PCT / 100)
+
+    liq_l = price - (1 / LEVERAGE) * price * 0.90
+    liq_s = price + (1 / LEVERAGE) * price * 0.90
+
+    tp_below_breakeven = TP_PCT < BREAKEVEN_TP
 
     long_fired = []
     if above_vwap:  long_fired.append('Price above VWAP')
@@ -233,18 +276,6 @@ def compute(candles):
     if adx_ok:      short_fired.append('ADX ' + str(round(adxv[i], 1)) + ' trend confirmed')
     if mdi_wins:    short_fired.append('-DI > +DI sellers in control')
     if h1_bear:     short_fired.append('1H EMA21 below EMA50 bearish')
-
-    tp_l = price * (1 + TP_PCT / 100)
-    sl_l = price * (1 - SL_PCT / 100)
-    tp_s = price * (1 - TP_PCT / 100)
-    sl_s = price * (1 + SL_PCT / 100)
-
-    risk_usd   = ACCOUNT_CAPITAL * (RISK_PCT / 100)
-    notional   = risk_usd / (SL_PCT / 100)
-    margin_req = notional / LEVERAGE
-    btc_qty    = notional / price
-    liq_l      = price - (1 / LEVERAGE) * price * 0.90
-    liq_s      = price + (1 / LEVERAGE) * price * 0.90
 
     signal = 'WAIT'
     if long_valid:
@@ -276,6 +307,10 @@ def compute(candles):
         'btc_qty':     btc_qty,
         'liq_l':       liq_l,
         'liq_s':       liq_s,
+        'fee_cost_usd':       round(fee_cost_usd, 4),
+        'tp_net_usd':         round(tp_net_usd, 4),
+        'sl_net_usd':         round(sl_net_usd, 4),
+        'tp_below_breakeven': tp_below_breakeven,
         'adx':         round(adxv[i], 1),
         'pdi':         round(pdi[i], 1),
         'mdi':         round(mdi[i], 1),
@@ -287,6 +322,7 @@ def compute(candles):
         'h1_bull':     h1_bull,
         'h1_bear':     h1_bear,
     }
+
 
 def send(message):
     if not TELEGRAM_TOKEN:
@@ -300,11 +336,14 @@ def send(message):
               'parse_mode': 'HTML'},
         timeout=10).raise_for_status()
 
+
 def build_long_alert(sig):
     reasons = '\n'.join('  - ' + r for r in sig['long_fired'])
     p = sig['price']
+    warn = ('\n⚠️  TP is below fee break-even (~{:.2f}%). Adjust TP_PCT.\n'.format(BREAKEVEN_TP)
+            if sig['tp_below_breakeven'] else '')
     lines = [
-        'LONG - BTC/USD',
+        '📈 LONG - BTC/USD',
         '=' * 28,
         'Price    $' + '{:,.2f}'.format(p),
         'Target   $' + '{:,.2f}'.format(sig['tp_l']) + '  (+' + str(TP_PCT) + '%)',
@@ -312,6 +351,12 @@ def build_long_alert(sig):
         'VWAP     $' + '{:,.2f}'.format(sig['vwap']),
         'ADX ' + str(sig['adx']) + '  RSI ' + str(sig['rsi']),
         '',
+        'Fee impact (round-trip):',
+        '  Fees     $' + '{:.4f}'.format(sig['fee_cost_usd']),
+        '  TP net   $' + '{:.4f}'.format(sig['tp_net_usd'])
+            + ('  ✅' if sig['tp_net_usd'] > 0 else '  ❌'),
+        '  SL loss  $' + '{:.4f}'.format(sig['sl_net_usd']),
+        warn,
         'Why LONG:',
         reasons,
         '',
@@ -322,7 +367,8 @@ def build_long_alert(sig):
         '  Max loss  $' + '{:,.2f}'.format(sig['risk_usd']),
         '  Est liq   $' + '{:,.2f}'.format(sig['liq_l']),
         '',
-        'ACTION: BUY on Kraken margin',
+        'ACTION: BUY on Kraken futures',
+        '💡 Use LIMIT order for maker fee (0.02% vs 0.05%)',
         'TP +' + str(TP_PCT) + '%  |  SL -' + str(SL_PCT) + '%',
         '',
         utc_now(),
@@ -330,11 +376,14 @@ def build_long_alert(sig):
     ]
     return '\n'.join(lines)
 
+
 def build_short_alert(sig):
     reasons = '\n'.join('  - ' + r for r in sig['short_fired'])
     p = sig['price']
+    warn = ('\n⚠️  TP is below fee break-even (~{:.2f}%). Adjust TP_PCT.\n'.format(BREAKEVEN_TP)
+            if sig['tp_below_breakeven'] else '')
     lines = [
-        'SHORT - BTC/USD',
+        '📉 SHORT - BTC/USD',
         '=' * 28,
         'Price    $' + '{:,.2f}'.format(p),
         'Target   $' + '{:,.2f}'.format(sig['tp_s']) + '  (-' + str(TP_PCT) + '%)',
@@ -342,6 +391,12 @@ def build_short_alert(sig):
         'VWAP     $' + '{:,.2f}'.format(sig['vwap']),
         'ADX ' + str(sig['adx']) + '  RSI ' + str(sig['rsi']),
         '',
+        'Fee impact (round-trip):',
+        '  Fees     $' + '{:.4f}'.format(sig['fee_cost_usd']),
+        '  TP net   $' + '{:.4f}'.format(sig['tp_net_usd'])
+            + ('  ✅' if sig['tp_net_usd'] > 0 else '  ❌'),
+        '  SL loss  $' + '{:.4f}'.format(sig['sl_net_usd']),
+        warn,
         'Why SHORT:',
         reasons,
         '',
@@ -352,7 +407,8 @@ def build_short_alert(sig):
         '  Max loss  $' + '{:,.2f}'.format(sig['risk_usd']),
         '  Est liq   $' + '{:,.2f}'.format(sig['liq_s']),
         '',
-        'ACTION: SELL on Kraken margin',
+        'ACTION: SELL on Kraken futures',
+        '💡 Use LIMIT order for maker fee (0.02% vs 0.05%)',
         'TP -' + str(TP_PCT) + '%  |  SL +' + str(SL_PCT) + '%',
         '',
         utc_now(),
@@ -360,15 +416,16 @@ def build_short_alert(sig):
     ]
     return '\n'.join(lines)
 
+
 def build_tp_alert(direction, entry, exit_p):
     pnl = abs(exit_p - entry) / entry * 100
     lines = [
-        'TAKE PROFIT HIT - BTC/USD',
+        '✅ TAKE PROFIT HIT - BTC/USD',
         '=' * 28,
         'Direction  ' + direction,
         'Entry    $' + '{:,.2f}'.format(entry),
         'Exit     $' + '{:,.2f}'.format(exit_p),
-        'P&L      +' + '{:.2f}'.format(pnl) + '%',
+        'Gross    +' + '{:.2f}'.format(pnl) + '%',
         '',
         'Close your position now.',
         '',
@@ -376,10 +433,11 @@ def build_tp_alert(direction, entry, exit_p):
     ]
     return '\n'.join(lines)
 
+
 def build_sl_alert(direction, entry, exit_p):
     pnl = abs(exit_p - entry) / entry * 100
     lines = [
-        'STOP LOSS HIT - BTC/USD',
+        '🛑 STOP LOSS HIT - BTC/USD',
         '=' * 28,
         'Direction  ' + direction,
         'Entry    $' + '{:,.2f}'.format(entry),
@@ -392,10 +450,11 @@ def build_sl_alert(direction, entry, exit_p):
     ]
     return '\n'.join(lines)
 
+
 def build_vwap_exit_alert(direction, entry, price):
     pnl = (price - entry) / entry * 100 if direction == 'LONG' else (entry - price) / entry * 100
     lines = [
-        'EARLY EXIT - BTC/USD',
+        '⚡ EARLY EXIT - BTC/USD',
         '=' * 28,
         'Direction  ' + direction,
         'Entry    $' + '{:,.2f}'.format(entry),
@@ -409,9 +468,10 @@ def build_vwap_exit_alert(direction, entry, price):
     ]
     return '\n'.join(lines)
 
+
 def build_cleared_alert(sig, prev):
     lines = [
-        'SIGNAL CLEARED - BTC/USD',
+        '🔄 SIGNAL CLEARED - BTC/USD',
         '=' * 28,
         'Price    $' + '{:,.2f}'.format(sig['price']),
         'Was: ' + prev + '  Now: WAIT',
@@ -422,12 +482,19 @@ def build_cleared_alert(sig, prev):
     ]
     return '\n'.join(lines)
 
+
 def reset_state():
     save_state({'signal': None, 'entry': None, 'tp': None,
                 'sl': None, 'time': None, 'consec_l': 0, 'consec_s': 0})
 
+
 def main():
     log('BTC VWAP Scalper - Long + Short')
+
+    if TP_PCT < BREAKEVEN_TP:
+        log('WARNING: TP_PCT ({:.2f}%) is below fee break-even ({:.2f}%). '
+            'Each winning trade will still lose money to fees.'.format(TP_PCT, BREAKEVEN_TP))
+
     state    = load_state()
     prev     = state.get('signal')
     entry    = state.get('entry')
@@ -455,10 +522,10 @@ def main():
         + '  MDI: ' + str(sig['mdi'])
         + '  RSI: ' + str(sig['rsi'])
         + '  H1Bear: ' + str(sig['h1_bear'])
-        + '  Session: ' + str(sig['session']))
+        + '  Session: ' + str(sig['session'])
+        + '  FeeRoundTrip: $' + str(sig['fee_cost_usd'])
+        + '  TPnet: $' + str(sig['tp_net_usd']))
 
-
-    # IN A LONG TRADE - monitor for exit
     if prev == 'LONG' and entry and tp_lvl and sl_lvl:
         if price >= tp_lvl:
             send(build_tp_alert('LONG', entry, price))
@@ -480,7 +547,6 @@ def main():
             + '  SL $' + '{:,.2f}'.format(sl_lvl))
         return
 
-    # IN A SHORT TRADE - monitor for exit
     if prev == 'SHORT' and entry and tp_lvl and sl_lvl:
         if price <= tp_lvl:
             send(build_tp_alert('SHORT', entry, price))
@@ -502,12 +568,11 @@ def main():
             + '  SL $' + '{:,.2f}'.format(sl_lvl))
         return
 
-    # NOT IN A TRADE - look for entries
     if sig['long_valid']:
         consec_l += 1
         consec_s  = 0
-        log('LONG building: ' + str(consec_l) + '/3')
-        if consec_l >= 3:
+        log('LONG building: ' + str(consec_l) + '/' + str(CONFIRM_CANDLES))
+        if consec_l >= CONFIRM_CANDLES:
             send(build_long_alert(sig))
             log('LONG alert sent')
             save_state({'signal': 'LONG', 'entry': price,
@@ -521,8 +586,8 @@ def main():
     elif sig['short_valid']:
         consec_s += 1
         consec_l  = 0
-        log('SHORT building: ' + str(consec_s) + '/3')
-        if consec_s >= 3:
+        log('SHORT building: ' + str(consec_s) + '/' + str(CONFIRM_CANDLES))
+        if consec_s >= CONFIRM_CANDLES:
             send(build_short_alert(sig))
             log('SHORT alert sent')
             save_state({'signal': 'SHORT', 'entry': price,
@@ -545,5 +610,6 @@ def main():
         log('WAIT')
 
     log('Scan complete')
+
 
 main()
