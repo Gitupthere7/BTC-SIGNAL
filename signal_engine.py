@@ -8,14 +8,18 @@ ACCOUNT_CAPITAL  = float(os.environ.get('ACCOUNT_CAPITAL', '100'))
 LEVERAGE         = int(os.environ.get('LEVERAGE', '10'))
 MIN_CONFIDENCE   = int(os.environ.get('MIN_CONFIDENCE', '4'))
 RISK_PCT         = float(os.environ.get('RISK_PER_TRADE', '2.0'))
-TP_PCT           = float(os.environ.get('TP_PCT', '0.6'))
-SL_PCT           = float(os.environ.get('SL_PCT', '0.12'))
-ADX_MIN          = float(os.environ.get('ADX_MIN', '18'))
+TP_PCT           = float(os.environ.get('TP_PCT', '1.5'))
+SL_PCT           = float(os.environ.get('SL_PCT', '0.40'))
+ADX_MIN          = float(os.environ.get('ADX_MIN', '22'))
 
-TAKER_FEE_PCT   = float(os.environ.get('TAKER_FEE_PCT', '0.05'))
+TAKER_FEE_PCT   = float(os.environ.get('TAKER_FEE_PCT', '0.26'))
 ROUND_TRIP_FEE  = TAKER_FEE_PCT * 2
 BREAKEVEN_TP    = ROUND_TRIP_FEE * 1.5
 CONFIRM_CANDLES = int(os.environ.get('CONFIRM_CANDLES', '2'))
+
+CANDLE_INTERVAL  = 15   # minutes — switched from 5 to 15
+BARS_PER_DAY     = 96   # 96 × 15min = 24hrs
+BARS_PER_HOUR    = 4    # 4  × 15min = 1hr
 
 STATE_DIR  = Path('.state')
 STATE_FILE = STATE_DIR / 'last_signal.json'
@@ -43,7 +47,7 @@ def log(msg):
     print('[' + ts + '] ' + str(msg))
 
 
-def fetch_candles(interval=5, count=500):
+def fetch_candles(interval=CANDLE_INTERVAL, count=500):
     since = int(time.time()) - interval * 60 * count
     url = ('https://api.kraken.com/0/public/OHLC'
            + '?pair=XBTUSD&interval=' + str(interval)
@@ -130,7 +134,7 @@ def adx_pdi_mdi(candles, p=14):
     return ema(dx, p), pdi, mdi
 
 
-def vwap_daily(candles, bars_per_day=288):
+def vwap_daily(candles, bars_per_day=BARS_PER_DAY):
     n   = len(candles)
     tp  = np.array([(c['h'] + c['l'] + c['c']) / 3 for c in candles])
     vol = np.array([c['v'] for c in candles])
@@ -143,7 +147,7 @@ def vwap_daily(candles, bars_per_day=288):
     return out
 
 
-def h1_ema(candles, period, bars_per_hour=12):
+def h1_ema(candles, period, bars_per_hour=BARS_PER_HOUR):
     n   = len(candles)
     cl  = np.array([c['c'] for c in candles])
     h1c = []
@@ -188,7 +192,7 @@ def compute(candles):
     e21   = ema(cl, 21)
     rv    = rsi(cl, 14)
     mh    = macd_hist(cl)
-    vw    = vwap_daily(candles, 288)
+    vw    = vwap_daily(candles)
     vm    = ema(vl, 20)
     adxv, pdi, mdi = adx_pdi_mdi(candles, 14)
     h1e21 = h1_ema(candles, 21)
@@ -343,7 +347,7 @@ def build_long_alert(sig):
     warn = ('\n⚠️  TP is below fee break-even (~{:.2f}%). Adjust TP_PCT.\n'.format(BREAKEVEN_TP)
             if sig['tp_below_breakeven'] else '')
     lines = [
-        '📈 LONG - BTC/USD',
+        '📈 LONG - BTC/USD  [15m]',
         '=' * 28,
         'Price    $' + '{:,.2f}'.format(p),
         'Target   $' + '{:,.2f}'.format(sig['tp_l']) + '  (+' + str(TP_PCT) + '%)',
@@ -351,7 +355,7 @@ def build_long_alert(sig):
         'VWAP     $' + '{:,.2f}'.format(sig['vwap']),
         'ADX ' + str(sig['adx']) + '  RSI ' + str(sig['rsi']),
         '',
-        'Fee impact (round-trip):',
+        'Fee impact (round-trip ~0.52%):',
         '  Fees     $' + '{:.4f}'.format(sig['fee_cost_usd']),
         '  TP net   $' + '{:.4f}'.format(sig['tp_net_usd'])
             + ('  ✅' if sig['tp_net_usd'] > 0 else '  ❌'),
@@ -367,8 +371,7 @@ def build_long_alert(sig):
         '  Max loss  $' + '{:,.2f}'.format(sig['risk_usd']),
         '  Est liq   $' + '{:,.2f}'.format(sig['liq_l']),
         '',
-        'ACTION: BUY on Kraken futures',
-        '💡 Use LIMIT order for maker fee (0.02% vs 0.05%)',
+        'ACTION: BUY on Kraken spot margin',
         'TP +' + str(TP_PCT) + '%  |  SL -' + str(SL_PCT) + '%',
         '',
         utc_now(),
@@ -383,7 +386,7 @@ def build_short_alert(sig):
     warn = ('\n⚠️  TP is below fee break-even (~{:.2f}%). Adjust TP_PCT.\n'.format(BREAKEVEN_TP)
             if sig['tp_below_breakeven'] else '')
     lines = [
-        '📉 SHORT - BTC/USD',
+        '📉 SHORT - BTC/USD  [15m]',
         '=' * 28,
         'Price    $' + '{:,.2f}'.format(p),
         'Target   $' + '{:,.2f}'.format(sig['tp_s']) + '  (-' + str(TP_PCT) + '%)',
@@ -391,7 +394,7 @@ def build_short_alert(sig):
         'VWAP     $' + '{:,.2f}'.format(sig['vwap']),
         'ADX ' + str(sig['adx']) + '  RSI ' + str(sig['rsi']),
         '',
-        'Fee impact (round-trip):',
+        'Fee impact (round-trip ~0.52%):',
         '  Fees     $' + '{:.4f}'.format(sig['fee_cost_usd']),
         '  TP net   $' + '{:.4f}'.format(sig['tp_net_usd'])
             + ('  ✅' if sig['tp_net_usd'] > 0 else '  ❌'),
@@ -407,8 +410,7 @@ def build_short_alert(sig):
         '  Max loss  $' + '{:,.2f}'.format(sig['risk_usd']),
         '  Est liq   $' + '{:,.2f}'.format(sig['liq_s']),
         '',
-        'ACTION: SELL on Kraken futures',
-        '💡 Use LIMIT order for maker fee (0.02% vs 0.05%)',
+        'ACTION: SELL on Kraken spot margin',
         'TP -' + str(TP_PCT) + '%  |  SL +' + str(SL_PCT) + '%',
         '',
         utc_now(),
@@ -489,7 +491,7 @@ def reset_state():
 
 
 def main():
-    log('BTC VWAP Scalper - Long + Short')
+    log('BTC VWAP Scalper - 15m - Long + Short')
 
     if TP_PCT < BREAKEVEN_TP:
         log('WARNING: TP_PCT ({:.2f}%) is below fee break-even ({:.2f}%). '
@@ -504,8 +506,8 @@ def main():
     consec_s = state.get('consec_s', 0)
     log('Prev: ' + str(prev) + '  ConsecL: ' + str(consec_l) + '  ConsecS: ' + str(consec_s))
 
-    log('Fetching candles...')
-    candles = fetch_candles(interval=5, count=500)
+    log('Fetching ' + str(CANDLE_INTERVAL) + 'm candles...')
+    candles = fetch_candles()
     price   = candles[-1]['c']
     log('Loaded ' + str(len(candles)) + ' candles. Price: $' + '{:,.2f}'.format(price))
 
@@ -521,6 +523,7 @@ def main():
         + '  PDI: ' + str(sig['pdi'])
         + '  MDI: ' + str(sig['mdi'])
         + '  RSI: ' + str(sig['rsi'])
+        + '  H1Bull: ' + str(sig['h1_bull'])
         + '  H1Bear: ' + str(sig['h1_bear'])
         + '  Session: ' + str(sig['session'])
         + '  FeeRoundTrip: $' + str(sig['fee_cost_usd'])
